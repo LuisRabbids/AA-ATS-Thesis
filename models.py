@@ -17,8 +17,17 @@ Four masking strategies are selectable via `mask_mode`:
                 -- a *proxy* for fixed-prior methods, NOT a reimplementation of
                    API-MAE or AMAP (those require atlas registration).
 
-Note on ViT-Base: depth 12, dim 768, 12 heads (Sec. 3.4.1 part 3). The decoder is
-deliberately lightweight (dim 384, depth 4) per the MAE design.
+Sampling direction (Sec. 3.4.3 part 3), for 'adaptive', 'anatomical' and 'hard_anat':
+  'visible'  high-scoring tokens are drawn as VISIBLE (AdaMAE convention)
+  'masked'   high-scoring tokens are drawn as MASKED (hard-patch-mining convention).
+             The N_m masked tokens are drawn from the same distribution P, and the
+             visible set is the complement. The sampler and its loss are unchanged.
+
+Background exclusion (Sec. 3.5.1): if a tissue index [B, N] is passed to forward(),
+both L_R and L_S are computed only over masked tokens that contain brain tissue.
+
+Backbone: ViT-Base is depth 12 / dim 768 / 12 heads; ViT-Small is depth 12 / dim 384 /
+6 heads. The decoder is deliberately lightweight (dim 384, depth 4) per the MAE design.
 """
 
 import math
@@ -84,16 +93,19 @@ class TokenSampler(nn.Module):
     Produces a categorical distribution P over the N tokens.
 
     fusion (Sec. 3.4.3 part 1), used when mode == 'anatomical':
-      'direct'    Eq. 3.10:  x~_i = MLP([x_i || A_i])
-      'learnable' Eq. 3.11:  A~_i = gamma * A_i + beta        (element-wise)
-                  Eq. 3.12:  x~_i = MLP([x_i || A~_i])
+      'direct'     Eq. 3.8:   x~_i = MLP([x_i || A_i])
+      'modulated'  Eq. 3.9:   A~_i = gamma * A_i + beta        (element-wise)
+      (alias       Eq. 3.10:  x~_i = MLP([x_i || A~_i])
+       'learnable')
 
     Scoring (Eq. 3.2-3.3, 3.13-3.14):
       Z = MHA(X~);  z_i = f_theta(x~_i);  p_i = softmax(z)_i
     """
 
-    def __init__(self, dim=768, n_anat=4, heads=8, fusion="learnable", use_anat=True):
+    def __init__(self, dim=768, n_anat=4, heads=8, fusion="modulated", use_anat=True):
         super().__init__()
+        fusion = "learnable" if fusion == "modulated" else fusion
+        assert fusion in {"direct", "learnable"}, f"unknown fusion '{fusion}'"
         self.use_anat = use_anat
         self.fusion = fusion
 
@@ -140,12 +152,15 @@ class MaskedAutoencoder(nn.Module):
         dec_heads=8,
         n_anat=4,
         mask_mode="anatomical",
-        fusion="learnable",
+        fusion="modulated",
         norm_pix_loss=False,
+        direction="visible",
     ):
         super().__init__()
         assert mask_mode in {"random", "adaptive", "anatomical", "hard_anat"}
+        assert direction in {"visible", "masked"}
         self.mask_mode = mask_mode
+        self.direction = direction
         self.patch = patch
         self.in_ch = in_ch
         self.norm_pix_loss = norm_pix_loss
@@ -218,28 +233,39 @@ class MaskedAutoencoder(nn.Module):
         """
         Returns (ids_keep [B, Nv], mask [B, N] with 1 = masked, probs [B, N] or None).
 
-        Visible tokens are drawn *without replacement* from P via multinomial sampling,
-        with N_v = N * (1 - p).
+        N_v = N * (1 - p). For the learned modes, tokens are drawn without replacement from
+        P via multinomial sampling (Eq. 3.13). Under direction 'visible' the drawn tokens
+        are the visible set; under 'masked' the N_m = N - N_v drawn tokens are the masked
+        set and the visible set is their complement.
         """
         B, N, _ = x.shape
         Nv = max(1, int(round(N * (1.0 - mask_ratio))))
+        Nm = N - Nv
         probs = None
 
         if self.mask_mode == "random":
             ids_keep = torch.rand(B, N, device=x.device).argsort(dim=1)[:, :Nv]
 
         elif self.mask_mode == "hard_anat":
-            # Fixed rule: keep the Nv patches with the strongest anatomical response.
-            # Deterministic and non-learnable, mirroring hard prior-based masking.
-            score = anat.mean(dim=-1) + 1e-4 * torch.rand_like(anat[..., 0])
-            ids_keep = score.argsort(dim=1, descending=True)[:, :Nv]
+            # Fixed rule, no learning: rank patches by mean Sobel response (tiny noise
+            # breaks ties). 'visible' keeps the top N_v; 'masked' hides the top N_m.
+            score = anat[..., 0] + 1e-4 * torch.rand_like(anat[..., 0])
+            descending = self.direction == "visible"
+            ids_keep = score.argsort(dim=1, descending=descending)[:, :Nv]
 
         else:  # 'adaptive' or 'anatomical'
-            probs = self.sampler(x, anat)                       # Eq. 3.3 / 3.14
-            ids_keep = torch.multinomial(probs, Nv, replacement=False)  # Eq. 3.15
+            # x is detached so L_S cannot reach the encoder through the patch embedding
+            probs = self.sampler(x.detach(), anat)                          # Eq. 3.12
+            if self.direction == "visible":
+                ids_keep = torch.multinomial(probs, Nv, replacement=False)  # Eq. 3.13
+            else:
+                ids_mask = torch.multinomial(probs, Nm, replacement=False)
+                m = torch.zeros(B, N, dtype=torch.bool, device=x.device)
+                m.scatter_(1, ids_mask, True)
+                ids_keep = (~m).nonzero(as_tuple=True)[1].view(B, Nv)
 
         mask = torch.ones(B, N, device=x.device)
-        mask.scatter_(1, ids_keep, 0.0)                          # 1 = masked
+        mask.scatter_(1, ids_keep, 0.0)                                     # 1 = masked
         return ids_keep, mask, probs
 
     # ---------------------------------------------------------------------------------
@@ -266,12 +292,19 @@ class MaskedAutoencoder(nn.Module):
             full = blk(full)
         return self.dec_pred(self.dec_norm(full))                # [B, N, p*p*C]
 
-    def forward(self, img, anat=None, mask_ratio=0.75):
+    def forward(self, img, anat=None, mask_ratio=0.75, tissue=None):
+        """
+        img    [B, 4, H, W]
+        anat   [B, N, 4]  anatomical features (zeros for random / adaptive)
+        tissue [B, N]     bool, patch contains brain. If None, every patch counts.
+        """
+        B = img.shape[0]
+        N = self.patch_embed.n_patches
         if anat is None:
-            anat = torch.zeros(img.shape[0], self.patch_embed.n_patches, 4, device=img.device)
+            anat = torch.zeros(B, N, 4, device=img.device)
 
         fv, mask, ids_keep, probs = self.forward_encoder(img, anat, mask_ratio)
-        pred = self.forward_decoder(fv, ids_keep, self.patch_embed.n_patches)
+        pred = self.forward_decoder(fv, ids_keep, N)
 
         target = self.patchify(img)
         if self.norm_pix_loss:
@@ -279,18 +312,18 @@ class MaskedAutoencoder(nn.Module):
             var = target.var(dim=-1, keepdim=True)
             target = (target - mu) / (var + 1e-6) ** 0.5
 
-        # Per-token reconstruction error
-        per_tok = ((pred - target) ** 2).mean(dim=-1)             # [B, N]
+        per_tok = ((pred - target) ** 2).mean(dim=-1)              # [B, N]
 
-        # Eq. 3.21: L_R averaged over masked tokens only
-        loss_recon = (per_tok * mask).sum() / mask.sum().clamp(min=1)
+        # Eq. 3.20: L_R over masked tokens that contain brain tissue (I_m ∩ B)
+        scored = mask if tissue is None else mask * tissue.float()
+        loss_recon = (per_tok * scored).sum() / scored.sum().clamp(min=1)
 
-        # Eq. 3.22: L_S = -sum_{i in I_m} p_i * L_R(i)
-        # Gradients are detached from the encoder-decoder (Sec. 3.5.2) so the sampler
-        # is optimized independently of the reconstruction network.
+        # Eq. 3.21: L_S = -sum_{i in I_m ∩ B} p_i * L_R(i). The reconstruction error is
+        # detached, so L_S updates only the sampler (Sec. 3.5.2). Identical in both
+        # sampling directions.
         loss_sampler = torch.zeros((), device=img.device)
         if probs is not None:
-            r = (per_tok * mask).detach()
+            r = (per_tok * scored).detach()
             loss_sampler = -(probs * r).sum(dim=1).mean()
 
         return {
@@ -299,7 +332,21 @@ class MaskedAutoencoder(nn.Module):
             "pred": pred,
             "mask": mask,
             "probs": probs,
+            "n_scored": scored.sum(),
         }
+
+    # ---------------------------------------------------------------------------------
+    # Fine-tuning (Sec. 3.7): full image, no masking, intermediate features for skips
+    # ---------------------------------------------------------------------------------
+    def encode_all(self, img, layers=(3, 6, 9, 12)):
+        """Run the encoder on all N tokens. Returns [B, N, D] after each listed block."""
+        x = self.patch_embed(img) + self.pos
+        feats = []
+        for i, blk in enumerate(self.blocks, 1):
+            x = blk(x)
+            if i in layers:
+                feats.append(self.norm(x) if i == len(self.blocks) else x)
+        return feats
 
 
 def build_model(args):
@@ -315,4 +362,5 @@ def build_model(args):
         mask_mode=args.mask_mode,
         fusion=args.fusion,
         norm_pix_loss=args.norm_pix_loss,
+        direction=getattr(args, "direction", "visible"),
     )
