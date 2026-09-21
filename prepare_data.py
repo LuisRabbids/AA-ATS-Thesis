@@ -80,9 +80,11 @@ def _nifti_from_bytes(raw):
 
 def iter_cases_from_tar(tar_path, wanted):
     """Stream the tar once, yielding (case_id, {modality: array}) as each case completes."""
-    buf = {}
+    buf, remaining = {}, set(wanted)
     with tarfile.open(tar_path, "r") as tf:
         for m in tf:
+            if not remaining:
+                break                      # every requested case already yielded
             if not m.isfile() or not m.name.endswith(".nii.gz"):
                 continue
             fname = os.path.basename(m.name)
@@ -93,6 +95,7 @@ def iter_cases_from_tar(tar_path, wanted):
             arr = _canonical(_nifti_from_bytes(tf.extractfile(m).read()))
             buf.setdefault(cid, {})[mod] = arr
             if len(buf[cid]) == 5:
+                remaining.discard(cid)
                 yield cid, buf.pop(cid)
     for cid, mods in buf.items():
         print(f"  [warn] {cid}: incomplete in tar ({sorted(mods)}), skipped")
