@@ -1,255 +1,287 @@
 """
 prepare_data.py
-Stage 1 of the pipeline: convert raw BraTS 2021 NIfTI volumes into cached 2D axial
-slices, following Section 3.3 of the manuscript.
+Convert raw BraTS 2021 volumes into cached 2D axial slices (manuscript Sec. 3.2-3.3).
 
-Steps implemented (manuscript Sec. 3.3):
-  3.3.1 Reorientation + cleaning   -> nibabel as_closest_canonical (RAS+); BraTS is
-                                      already skull-stripped and N4 bias-corrected.
-  3.3.2 Slice extraction           -> axial slices; every Nth slice for pretraining,
-                                      all brain-containing slices for fine-tuning.
-  3.3.3 Normalization              -> per-slice min-max scaling to [0, 1].
-  3.3.4 Resizing                   -> 224 x 224 (patching happens in the model).
+Pipeline per case
+-----------------
+  3.3.1  Reorientation    nibabel as_closest_canonical (RAS+). BraTS 2021 is distributed
+                          skull-stripped and co-registered, so no further cleaning is done.
+  3.3.2  Slice selection  a slice is kept if ANY of the four modalities has a non-zero voxel.
+                          Pre-training keeps every `--pretrain_stride`-th kept slice;
+                          fine-tuning keeps all of them (sub-sampling happens at load time).
+  3.3.3  Normalization    per volume, per modality: divide by the 99.5th percentile of brain
+                          voxels, clip to [0, 1]. Background is 0 by construction.
+  3.3.4  Cropping         center crop 240 -> 224 (indices 8..231). No resampling.
+                          Verified on all 1,251 cases: no brain voxel falls outside the crop.
+  Tissue index (set B)    per slice, a boolean [196] marking 16x16 patches that contain any
+                          non-zero voxel in any modality (used by the loss, Sec. 3.5.1).
 
-Expected input layout (standard BraTS 2021 release):
-  <braTS_root>/
-    BraTS2021_00000/
-      BraTS2021_00000_flair.nii.gz
-      BraTS2021_00000_t1.nii.gz
-      BraTS2021_00000_t1ce.nii.gz
-      BraTS2021_00000_t2.nii.gz
-      BraTS2021_00000_seg.nii.gz
-    BraTS2021_00002/
-      ...
+Splits (Sec. 3.2.2)
+-------------------
+  Reads metadata/partitions.json (200 development / 1,051 experimental cases) and
+  metadata/tumor_volumes.json, and writes splits.json:
+    dev      : one 80/20 train/val split of the development partition   (Stage 1)
+    fold_1-5 : 5-fold CV over the experimental partition                 (Stage 2)
+  Both are stratified by whole-tumour volume.
 
-Output layout:
-  <out_root>/
-    pretrain/<PatientID>.npz   ->  img: uint8 [S, 4, 224, 224]
-    finetune/<PatientID>.npz   ->  img: uint8 [S, 4, 224, 224], seg: uint8 [S, 224, 224]
-    manifest.csv               ->  patient_id, n_pretrain_slices, n_finetune_slices
-    folds.json                 ->  patient-level 5-fold split (Sec. 3.2.1)
+Input: either extracted case folders (--brats_root) or the Kaggle tar directly (--brats_tar).
 
-Usage:
-  python prepare_data.py --brats_root /data/BraTS2021 --out_root ./cache
-  python prepare_data.py --brats_root /data/BraTS2021 --out_root ./cache --limit 50
+Output
+------
+  <out>/pretrain/<case>.npz   img uint8 [S,4,224,224], tissue bool [S,196]
+  <out>/finetune/<case>.npz   img uint8 [S,4,224,224], seg uint8 [S,224,224], tissue bool [S,196]
+  <out>/manifest.csv          per-case slice counts and tumour volume
+  <out>/splits.json
+
+Labels: BraTS {0,1,2,4} are remapped to {0,1,2,3} so classes are contiguous for
+cross-entropy. 1 = NCR/NET, 2 = ED, 3 = ET (originally 4).
+
+Usage
+-----
+  python prepare_data.py --brats_tar  /path/BraTS2021_Training_Data.tar --out ./cache
+  python prepare_data.py --brats_root /path/extracted_cases            --out ./cache
+  add --limit 5 for a quick test run
 """
 
 import argparse
+import gzip
+import io
 import json
 import os
+import tarfile
+import time
+from multiprocessing import Pool
 from pathlib import Path
 
-import cv2
 import numpy as np
 
-MODALITIES = ["t1", "t1ce", "t2", "flair"]  # channel order = C0..C3
+MODALITIES = ["t1", "t1ce", "t2", "flair"]   # channel order C0..C3 (FLAIR = channel 3)
+FULL = 240
+SIZE = 224
+LO = (FULL - SIZE) // 2                        # 8
+HI = LO + SIZE                                 # 232 (exclusive)
+PATCH = 16
+GRID = SIZE // PATCH                           # 14 -> 196 patches
 
 
 # --------------------------------------------------------------------------------------
-# I/O helpers
+# Loading
 # --------------------------------------------------------------------------------------
-def find_modality_file(case_dir: Path, pid: str, mod: str):
-    """BraTS naming varies slightly between mirrors; try the common patterns."""
-    for pattern in (f"{pid}_{mod}.nii.gz", f"{pid}_{mod}.nii", f"*_{mod}.nii.gz"):
-        hits = sorted(case_dir.glob(pattern))
-        if hits:
-            return hits[0]
-    return None
-
-
-def load_canonical(path: Path) -> np.ndarray:
-    """Load a NIfTI volume and reorient to closest canonical (RAS+) axes."""
+def _canonical(img):
     import nibabel as nib
-
-    img = nib.load(str(path))
-    img = nib.as_closest_canonical(img)
-    return np.asanyarray(img.dataobj).astype(np.float32)
+    return np.asanyarray(nib.as_closest_canonical(img).dataobj)
 
 
-# --------------------------------------------------------------------------------------
-# Preprocessing (Sec. 3.3.3 / 3.3.4)
-# --------------------------------------------------------------------------------------
-def minmax_norm(slice_2d: np.ndarray, clip_percentile: float = 99.5) -> np.ndarray:
-    """
-    Per-slice min-max normalization into [0, 1] (manuscript Sec. 3.3.3).
-
-    A high-percentile clip is applied first so that a handful of hyper-intense
-    voxels do not compress the whole dynamic range. Set clip_percentile=100 to
-    disable and get textbook min-max.
-    """
-    brain = slice_2d[slice_2d > 0]
-    if brain.size == 0:
-        return np.zeros_like(slice_2d, dtype=np.float32)
-    hi = np.percentile(brain, clip_percentile) if clip_percentile < 100 else brain.max()
-    lo = brain.min()
-    if hi <= lo:
-        return np.zeros_like(slice_2d, dtype=np.float32)
-    out = (slice_2d - lo) / (hi - lo)
-    return np.clip(out, 0.0, 1.0).astype(np.float32)
+def _nifti_from_bytes(raw):
+    import nibabel as nib
+    fh = nib.FileHolder(fileobj=io.BytesIO(gzip.decompress(raw)))
+    return nib.Nifti1Image.from_file_map({"header": fh, "image": fh})
 
 
-def resize_img(slice_2d: np.ndarray, size: int) -> np.ndarray:
-    return cv2.resize(slice_2d, (size, size), interpolation=cv2.INTER_LINEAR)
+def iter_cases_from_tar(tar_path, wanted):
+    """Stream the tar once, yielding (case_id, {modality: array}) as each case completes."""
+    buf = {}
+    with tarfile.open(tar_path, "r") as tf:
+        for m in tf:
+            if not m.isfile() or not m.name.endswith(".nii.gz"):
+                continue
+            fname = os.path.basename(m.name)
+            parts = fname.replace(".nii.gz", "").split("_")
+            cid, mod = f"{parts[0]}_{parts[1]}", parts[2]
+            if cid not in wanted:
+                continue
+            arr = _canonical(_nifti_from_bytes(tf.extractfile(m).read()))
+            buf.setdefault(cid, {})[mod] = arr
+            if len(buf[cid]) == 5:
+                yield cid, buf.pop(cid)
+    for cid, mods in buf.items():
+        print(f"  [warn] {cid}: incomplete in tar ({sorted(mods)}), skipped")
 
 
-def resize_lbl(slice_2d: np.ndarray, size: int) -> np.ndarray:
-    return cv2.resize(slice_2d, (size, size), interpolation=cv2.INTER_NEAREST)
-
-
-def brain_fraction(slice_2d: np.ndarray) -> float:
-    return float((slice_2d > 0).mean())
+def iter_cases_from_folders(root, wanted):
+    import nibabel as nib
+    for cid in sorted(wanted):
+        d = Path(root, cid)
+        mods = {}
+        for mod in MODALITIES + ["seg"]:
+            f = d / f"{cid}_{mod}.nii.gz"
+            if not f.exists():
+                break
+            mods[mod] = _canonical(nib.load(str(f)))
+        if len(mods) == 5:
+            yield cid, mods
+        else:
+            print(f"  [warn] {cid}: missing files, skipped")
 
 
 # --------------------------------------------------------------------------------------
 # Per-case processing
 # --------------------------------------------------------------------------------------
-def process_case(case_dir: Path, args):
-    pid = case_dir.name
-
-    vols = {}
-    for mod in MODALITIES:
-        f = find_modality_file(case_dir, pid, mod)
-        if f is None:
-            print(f"  [skip] {pid}: missing modality '{mod}'")
-            return None
-        vols[mod] = load_canonical(f)
-
-    seg_path = find_modality_file(case_dir, pid, "seg")
-    seg_vol = load_canonical(seg_path) if seg_path is not None else None
-
-    shapes = {v.shape for v in vols.values()}
-    if len(shapes) != 1:
-        print(f"  [skip] {pid}: inconsistent modality shapes {shapes}")
-        return None
-
-    n_axial = next(iter(vols.values())).shape[2]
-
-    # Which slices actually contain brain? (avoids wasting capacity on empty air)
-    ref = vols["flair"]
-    valid = [z for z in range(n_axial) if brain_fraction(ref[:, :, z]) >= args.min_brain_frac]
-    if not valid:
-        print(f"  [skip] {pid}: no slices above min_brain_frac")
-        return None
-
-    # Sec. 3.3.2 differential slicing: stride for pretraining, all slices for fine-tuning
-    pre_idx = valid[:: args.pretrain_stride]
-    fine_idx = valid
-
-    def build(indices, want_seg):
-        imgs = np.zeros((len(indices), len(MODALITIES), args.size, args.size), np.uint8)
-        segs = np.zeros((len(indices), args.size, args.size), np.uint8) if want_seg else None
-        for i, z in enumerate(indices):
-            for c, mod in enumerate(MODALITIES):
-                s = minmax_norm(vols[mod][:, :, z], args.clip_percentile)
-                imgs[i, c] = (resize_img(s, args.size) * 255.0).round().astype(np.uint8)
-            if want_seg and seg_vol is not None:
-                lab = seg_vol[:, :, z].astype(np.uint8)
-                lab[lab == 4] = 3  # BraTS labels {0,1,2,4} -> {0,1,2,3}
-                segs[i] = resize_lbl(lab, args.size)
-        return imgs, segs
-
-    pre_imgs, _ = build(pre_idx, want_seg=False)
-    np.savez_compressed(Path(args.out_root, "pretrain", f"{pid}.npz"), img=pre_imgs)
-
-    n_fine = 0
-    if seg_vol is not None and not args.pretrain_only:
-        fine_imgs, fine_segs = build(fine_idx, want_seg=True)
-        np.savez_compressed(
-            Path(args.out_root, "finetune", f"{pid}.npz"), img=fine_imgs, seg=fine_segs
-        )
-        n_fine = len(fine_idx)
-
-    tumor_vox = int((seg_vol > 0).sum()) if seg_vol is not None else 0
-    return dict(
-        patient_id=pid,
-        n_pretrain_slices=len(pre_idx),
-        n_finetune_slices=n_fine,
-        tumor_voxels=tumor_vox,
-    )
+def normalize_volume(vol, pct=99.5):
+    """Sec. 3.3.3: per-volume scaling to [0, 1]. Background (0) stays 0."""
+    vol = vol.astype(np.float32)
+    brain = vol[vol > 0]
+    if brain.size == 0:
+        return np.zeros_like(vol)
+    hi = np.percentile(brain, pct)
+    return np.clip(vol / max(hi, 1e-6), 0.0, 1.0)
 
 
-# --------------------------------------------------------------------------------------
-# Patient-level 5-fold split (Sec. 3.2.1)
-# --------------------------------------------------------------------------------------
-def make_folds(records, k=5, seed=42):
-    """
-    Patient-level K-fold split, stratified by total tumour burden so that each fold
-    stays representative of the overall tumour-size distribution (manuscript Sec. 3.2.1).
-    """
-    rng = np.random.RandomState(seed)
-    recs = [r for r in records if r["n_finetune_slices"] > 0] or list(records)
-    order = np.argsort([r["tumor_voxels"] for r in recs])
+def tissue_index(nonzero_2d):
+    """[224,224] bool -> [196] bool: patch contains any non-zero voxel."""
+    return nonzero_2d.reshape(GRID, PATCH, GRID, PATCH).any(axis=(1, 3)).reshape(-1)
 
-    strata, folds = [], {i: [] for i in range(k)}
-    for start in range(0, len(order), k):  # bins of k consecutive patients by burden
-        strata.append([recs[j]["patient_id"] for j in order[start : start + k]])
-    for stratum in strata:
-        stratum = list(stratum)
-        rng.shuffle(stratum)
-        for i, pid in enumerate(stratum):
-            folds[i % k].append(pid)
 
-    all_pids = [r["patient_id"] for r in records]
-    assigned = {p for v in folds.values() for p in v}
-    for i, pid in enumerate(p for p in all_pids if p not in assigned):
-        folds[i % k].append(pid)
+def process_case(job):
+    cid, mods, out, stride = job
+
+    shapes = {mods[m].shape for m in MODALITIES + ["seg"]}
+    if shapes != {(FULL, FULL, mods["flair"].shape[2])}:
+        return {"case_id": cid, "error": f"unexpected shapes {shapes}"}
+
+    raw = np.stack([mods[m] for m in MODALITIES])                # [4, 240, 240, Z]
+    nonzero = (raw != 0).any(axis=0)                               # [240, 240, Z]
+
+    # Safety: the crop must never discard brain tissue.
+    lost = int(nonzero.sum() - nonzero[LO:HI, LO:HI].sum())
+    if lost:
+        return {"case_id": cid, "error": f"crop would discard {lost} brain voxels"}
+
+    keep = [z for z in range(raw.shape[3]) if nonzero[:, :, z].any()]
+    if not keep:
+        return {"case_id": cid, "error": "no brain-containing slices"}
+
+    norm = np.stack([normalize_volume(raw[c]) for c in range(4)])  # [4, 240, 240, Z]
+    norm = norm[:, LO:HI, LO:HI, :]
+    nz = nonzero[LO:HI, LO:HI, :]
+
+    seg = mods["seg"].astype(np.uint8)[LO:HI, LO:HI, :]
+    seg[seg == 4] = 3
+
+    def pack(zs):
+        img = (np.transpose(norm[..., zs], (3, 0, 1, 2)) * 255.0).round().astype(np.uint8)
+        tis = np.stack([tissue_index(nz[:, :, z]) for z in zs])
+        return img, tis
+
+    pre_z = keep[::stride]
+    img, tis = pack(pre_z)
+    np.savez_compressed(Path(out, "pretrain", f"{cid}.npz"), img=img, tissue=tis)
+
+    img, tis = pack(keep)
+    np.savez_compressed(Path(out, "finetune", f"{cid}.npz"),
+                        img=img, seg=np.transpose(seg[..., keep], (2, 0, 1)), tissue=tis)
 
     return {
-        f"fold_{i+1}": {
-            "val": sorted(folds[i]),
-            "train": sorted(p for j in range(k) if j != i for p in folds[j]),
-        }
-        for i in range(k)
+        "case_id": cid,
+        "n_brain_slices": len(keep),
+        "n_pretrain_slices": len(pre_z),
+        "n_finetune_slices": len(keep),
+        "tumor_voxels": int((seg > 0).sum()),
+        "mean_tissue_frac": float(tis.mean()),
     }
 
 
+# --------------------------------------------------------------------------------------
+# Splits (Sec. 3.2.2)
+# --------------------------------------------------------------------------------------
+def stratified_kfold(ids, volumes, k, seed):
+    """Sort by tumour volume, deal cases round-robin within shuffled strata of size k."""
+    rng = np.random.RandomState(seed)
+    order = sorted(ids, key=lambda c: volumes[c])
+    folds = [[] for _ in range(k)]
+    for start in range(0, len(order), k):
+        stratum = order[start:start + k]
+        rng.shuffle(stratum)
+        for i, cid in enumerate(stratum):
+            folds[i].append(cid)
+    return [sorted(f) for f in folds]
+
+
+def make_splits(partitions, volumes, seed):
+    dev = [c for c in partitions["development"] if c in volumes]
+    exp = [c for c in partitions["experimental"] if c in volumes]
+
+    dev_folds = stratified_kfold(dev, volumes, 5, seed)     # 1 of 5 = 20% validation
+    splits = {"dev": {"val": dev_folds[0],
+                      "train": sorted(c for f in dev_folds[1:] for c in f)}}
+
+    exp_folds = stratified_kfold(exp, volumes, 5, seed)
+    for i in range(5):
+        splits[f"fold_{i+1}"] = {
+            "val": exp_folds[i],
+            "train": sorted(c for j, f in enumerate(exp_folds) if j != i for c in f),
+        }
+    return splits
+
+
+# --------------------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--brats_root", required=True, help="Directory of BraTS2021_XXXXX folders")
-    ap.add_argument("--out_root", default="./cache")
-    ap.add_argument("--size", type=int, default=224)
-    ap.add_argument("--pretrain_stride", type=int, default=5, help="Sec. 3.3.2: every Nth slice")
-    ap.add_argument("--min_brain_frac", type=float, default=0.02)
-    ap.add_argument("--clip_percentile", type=float, default=99.5)
-    ap.add_argument("--limit", type=int, default=0, help="Process only the first N patients")
-    ap.add_argument("--pretrain_only", action="store_true")
-    ap.add_argument("--folds", type=int, default=5)
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--brats_tar", help="Path to BraTS2021_Training_Data.tar")
+    src.add_argument("--brats_root", help="Directory of extracted BraTS2021_XXXXX folders")
+    ap.add_argument("--out", default="./cache")
+    ap.add_argument("--metadata", default="./metadata")
+    ap.add_argument("--pretrain_stride", type=int, default=5)
+    ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1))
+    ap.add_argument("--limit", type=int, default=0, help="Process only N cases (testing)")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 
-    os.makedirs(Path(args.out_root, "pretrain"), exist_ok=True)
-    os.makedirs(Path(args.out_root, "finetune"), exist_ok=True)
+    for sub in ("pretrain", "finetune"):
+        os.makedirs(Path(args.out, sub), exist_ok=True)
 
-    cases = sorted(d for d in Path(args.brats_root).iterdir() if d.is_dir())
+    with open(Path(args.metadata, "partitions.json")) as f:
+        partitions = json.load(f)
+    wanted = set(partitions["development"]) | set(partitions["experimental"])
+
+    # Resume: skip cases already written.
+    done = {p.stem for p in Path(args.out, "finetune").glob("*.npz")}
+    todo = wanted - done
     if args.limit:
-        cases = cases[: args.limit]
-    print(f"Found {len(cases)} candidate cases under {args.brats_root}")
+        todo = set(sorted(todo)[: args.limit])
+    print(f"{len(wanted)} cases in partitions | {len(done)} already cached | {len(todo)} to process")
 
-    records = []
-    for i, case in enumerate(cases, 1):
-        try:
-            rec = process_case(case, args)
-        except Exception as e:  # keep going; report at the end
-            print(f"  [error] {case.name}: {type(e).__name__}: {e}")
-            rec = None
-        if rec:
-            records.append(rec)
-        if i % 25 == 0 or i == len(cases):
-            print(f"  processed {i}/{len(cases)}  (kept {len(records)})")
+    source = (iter_cases_from_tar(args.brats_tar, todo) if args.brats_tar
+              else iter_cases_from_folders(args.brats_root, todo))
+    jobs = ((cid, mods, args.out, args.pretrain_stride) for cid, mods in source)
 
-    if not records:
-        raise SystemExit("No cases processed successfully. Check --brats_root layout.")
+    manifest_path = Path(args.out, "manifest.csv")
+    records, errors, t0 = [], [], time.time()
+    with Pool(args.workers) as pool:
+        for i, rec in enumerate(pool.imap_unordered(process_case, jobs), 1):
+            (errors if "error" in rec else records).append(rec)
+            if i % 25 == 0 or i == len(todo):
+                rate = i / (time.time() - t0)
+                eta = (len(todo) - i) / max(rate, 1e-9) / 60
+                print(f"  {i}/{len(todo)}  {rate:.2f} cases/s  ETA {eta:.0f} min")
 
     import pandas as pd
+    new = pd.DataFrame(records)
+    if manifest_path.exists() and len(new):
+        new = pd.concat([pd.read_csv(manifest_path), new]).drop_duplicates("case_id", keep="last")
+    elif manifest_path.exists():
+        new = pd.read_csv(manifest_path)
+    if len(new):
+        new.sort_values("case_id").to_csv(manifest_path, index=False)
 
-    pd.DataFrame(records).to_csv(Path(args.out_root, "manifest.csv"), index=False)
-    with open(Path(args.out_root, "folds.json"), "w") as f:
-        json.dump(make_folds(records, args.folds, args.seed), f, indent=2)
+    for e in errors:
+        print(f"  [error] {e['case_id']}: {e['error']}")
 
-    tot_pre = sum(r["n_pretrain_slices"] for r in records)
-    tot_fine = sum(r["n_finetune_slices"] for r in records)
-    print(f"\nDone. {len(records)} patients | {tot_pre} pretrain slices | {tot_fine} finetune slices")
-    print(f"Wrote manifest.csv and folds.json to {args.out_root}")
+    with open(Path(args.metadata, "tumor_volumes.json")) as f:
+        volumes = json.load(f)
+    splits = make_splits(partitions, volumes, args.seed)
+    with open(Path(args.out, "splits.json"), "w") as f:
+        json.dump(splits, f, indent=1)
+
+    print(f"\nDone in {(time.time()-t0)/60:.1f} min. "
+          f"{len(records)} processed, {len(errors)} errors, {len(new)} total in manifest.")
+    if len(new):
+        print(f"  pre-training slices: {int(new.n_pretrain_slices.sum()):,}")
+        print(f"  fine-tuning slices:  {int(new.n_finetune_slices.sum()):,}")
+        print(f"  mean tissue fraction per slice (rho, cropped): {new.mean_tissue_frac.mean():.3f}")
+    print(f"  splits.json: dev {len(splits['dev']['train'])}/{len(splits['dev']['val'])} "
+          f"train/val, fold_1 {len(splits['fold_1']['train'])}/{len(splits['fold_1']['val'])}")
 
 
 if __name__ == "__main__":
