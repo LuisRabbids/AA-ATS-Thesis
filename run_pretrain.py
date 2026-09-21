@@ -1,281 +1,184 @@
 """
 run_pretrain.py
-Phase I self-supervised pretraining + RQ1 reconstruction experiment
-(manuscript Sec. 3.5-3.6, Sec. 3.8.1 / Table 3.1).
+Phase I self-supervised pre-training (manuscript Sec. 3.5-3.6).
 
-Trains one (model, masking-ratio) configuration and appends the final masked-patch
-MSE to results/reconstruction.csv, which plot_results.py turns into Table 3.1.
+Trains one masked autoencoder configuration on the pre-training slices of a split,
+saves the encoder checkpoint, and reports reconstruction MSE on the split's validation
+cases under a FIXED random mask (Sec. 3.8.3): every model is scored on byte-identical
+masked patches, independent of how it masked during training, and only on patches that
+contain brain tissue.
+
+Optimization (Sec. 3.6.1): AdamW, cosine schedule with linear warm-up, separate learning
+rate for the token sampler, fixed epoch budget, final checkpoint. A checkpoint is written
+every epoch so an interrupted run resumes where it stopped.
 
 Single run:
-  python run_pretrain.py --cache ./cache --mask_mode anatomical --mask_ratio 0.75 --epochs 20
+  python run_pretrain.py --cache ./cache --mask_mode anatomical --fusion modulated \
+      --direction visible --mask_ratio 0.75 --epochs 50
 
-Full RQ1 sweep (4 strategies x 3 ratios = 12 runs):
-  python run_pretrain.py --cache ./cache --sweep --epochs 20
-
-Smoke test with no data at all (validates shapes and the loss in ~1 minute on CPU):
-  python run_pretrain.py --synthetic --epochs 1 --steps_per_epoch 5 --batch_size 2 --dim 192 --depth 2
+The Stage 1 grid is driven by run_stage1.py, which calls pretrain() below.
 """
 
 import argparse
-import csv
 import json
 import math
-import os
 import time
 from pathlib import Path
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 
-from models import build_model
+from data import BraTSSliceDataset, load_split
+from models import MaskedAutoencoder
 
-
-# --------------------------------------------------------------------------------------
-def get_device(pref="auto"):
-    if pref != "auto":
-        return torch.device(pref)
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
+BACKBONES = {"small": dict(dim=384, depth=12, heads=6), "base": dict(dim=768, depth=12, heads=12)}
+DEFAULTS = dict(
+    mask_mode="anatomical", fusion="modulated", direction="visible", mask_ratio=0.75,
+    backbone="small", epochs=50, batch_size=64, lr=1.5e-4, sampler_lr=1e-4,
+    weight_decay=0.05, lambda_sampler=1.0, clip=1.0, split="dev", eval_ratio=0.75,
+    workers=4, device="cuda", amp=True, seed=42,
+)
 
 
-class SyntheticDataset(Dataset):
-    """Random brain-like phantoms, for validating the pipeline before BraTS is staged."""
-
-    def __init__(self, n=64, img_size=224, patch=16):
-        self.n, self.img_size, self.patch = n, img_size, patch
-
-    def __len__(self):
-        return self.n
-
-    def __getitem__(self, i):
-        from anatomy import anatomical_features
-
-        rng = np.random.RandomState(i)
-        H = self.img_size
-        yy, xx = np.mgrid[0:H, 0:H]
-        cy, cx = H / 2 + rng.randn() * 6, H / 2 + rng.randn() * 6
-        brain = (((yy - cy) / (H * 0.36)) ** 2 + ((xx - cx) / (H * 0.30)) ** 2) < 1.0
-        img = np.stack([brain * rng.uniform(0.5, 0.9) for _ in range(4)]).astype(np.float32)
-        ty, tx = rng.randint(70, 150, size=2)
-        img[:, ty : ty + 22, tx : tx + 22] += 0.3  # bright "lesion"
-        img = np.clip(img + rng.normal(0, 0.02, img.shape), 0, 1).astype(np.float32)
-        A, _ = anatomical_features(img, kind="hybrid", patch=self.patch)
-        return {"img": torch.from_numpy(img), "anat": torch.from_numpy(A)}
-
-
-def build_loaders(args):
-    if args.synthetic:
-        tr = SyntheticDataset(args.batch_size * max(args.steps_per_epoch, 1) * 2,
-                              args.img_size, args.patch)
-        va = SyntheticDataset(args.batch_size * 2, args.img_size, args.patch)
-    else:
-        from data import BraTSSliceDataset, load_fold
-
-        train_ids, val_ids = load_fold(args.cache, args.fold)
-        anat_kind = None if args.mask_mode in {"random", "adaptive"} else args.anat_kind
-        common = dict(cache_root=args.cache, stage="pretrain", anat_kind=anat_kind,
-                      patch=args.patch, img_size=args.img_size,
-                      max_slices_per_patient=args.max_slices_per_patient)
-        tr = BraTSSliceDataset(split_patients=train_ids, augment=True, **common)
-        va = BraTSSliceDataset(split_patients=val_ids, augment=False, **common)
-        print(f"Fold {args.fold}: {len(train_ids)} train / {len(val_ids)} val patients | "
-              f"{len(tr)} train / {len(va)} val slices")
-
-    kw = dict(batch_size=args.batch_size, num_workers=args.workers,
-              pin_memory=True, drop_last=True, persistent_workers=args.workers > 0)
-    return DataLoader(tr, shuffle=True, **kw), DataLoader(va, shuffle=False, **kw)
-
-
-def cosine_lr(step, total, base_lr, warmup):
+def cosine_lr(step, total, base, warmup):
     if step < warmup:
-        return base_lr * step / max(warmup, 1)
-    prog = (step - warmup) / max(total - warmup, 1)
-    return base_lr * 0.5 * (1.0 + math.cos(math.pi * prog))
+        return base * (step + 1) / warmup
+    return base * 0.5 * (1 + math.cos(math.pi * (step - warmup) / max(1, total - warmup)))
 
 
-# --------------------------------------------------------------------------------------
+def build(cfg):
+    return MaskedAutoencoder(mask_mode=cfg["mask_mode"], fusion=cfg["fusion"],
+                             direction=cfg["direction"], **BACKBONES[cfg["backbone"]])
+
+
 @torch.no_grad()
-def evaluate(model, loader, mask_ratio, device, max_batches=0):
-    """Mean masked-patch MSE over the validation split -> the Table 3.1 number."""
+def fixed_mask_mse(model, ds, device, ratio=0.75, seed=1234, batch_size=64, workers=4, amp=True):
+    """Sec. 3.8.3 protocol: identical random mask for every model, brain patches only."""
+    orig = model.mask_mode
+    model.mask_mode = "random"
     model.eval()
-    tot, n = 0.0, 0
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=workers)
+    tot, cnt = 0.0, 0.0
     for i, b in enumerate(loader):
-        if max_batches and i >= max_batches:
-            break
-        out = model(b["img"].to(device), b["anat"].to(device), mask_ratio)
-        tot += out["loss_recon"].item()
-        n += 1
+        torch.manual_seed(seed + i)
+        with torch.autocast(device.type, enabled=amp and device.type == "cuda"):
+            out = model(b["img"].to(device), b["anat"].to(device), ratio,
+                        b["tissue"].to(device))
+        n = float(out["n_scored"])
+        tot += float(out["loss_recon"]) * n
+        cnt += n
+    model.mask_mode = orig
     model.train()
-    return tot / max(n, 1)
+    return tot / max(cnt, 1.0)
 
 
-def train_one(args):
-    device = get_device(args.device)
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
+class TimeUp(Exception):
+    """Raised after a checkpoint when the next epoch would overrun the session deadline."""
 
-    train_loader, val_loader = build_loaders(args)
-    model = build_model(args).to(device)
-    n_par = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-    tag = f"{args.mask_mode}_{args.fusion}_{args.anat_kind}_p{args.mask_ratio}"
-    print(f"\n=== {tag} | device={device} | {n_par/1e6:.1f}M params ===")
+def pretrain(cache, out_dir, log=print, should_stop=None, **overrides):
+    """Pre-train one configuration. Returns dict(checkpoint=..., fixed_mask_mse=..., ...).
+    should_stop(epoch_seconds) -> bool is checked after each saved epoch."""
+    cfg = {**DEFAULTS, **overrides}
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    result_path, final_path = out_dir / "pretrain_result.json", out_dir / "pretrain.pt"
+    if result_path.exists() and final_path.exists():
+        log(f"  pretrain already complete -> {final_path}")
+        return json.load(open(result_path))
 
-    # Sec. 3.6.1: AdamW (decoupled weight decay), cosine schedule, warmup.
-    sampler_params = [p for n, p in model.named_parameters() if n.startswith("sampler.")]
-    other_params = [p for n, p in model.named_parameters() if not n.startswith("sampler.")]
-    groups = [{"params": other_params, "lr": args.lr}]
-    if sampler_params:
-        groups.append({"params": sampler_params, "lr": args.sampler_lr})
-    opt = torch.optim.AdamW(groups, lr=args.lr, betas=(0.9, 0.95),
-                            weight_decay=args.weight_decay)
+    device = torch.device(cfg["device"] if (cfg["device"] != "cuda" or torch.cuda.is_available())
+                          else "cpu")
+    torch.manual_seed(cfg["seed"])
+    np.random.seed(cfg["seed"])
 
-    steps_per_epoch = args.steps_per_epoch or len(train_loader)
-    total_steps = steps_per_epoch * args.epochs
-    warmup = int(total_steps * 0.1)
-    amp = device.type == "cuda" and not args.no_amp
-    scaler = torch.cuda.amp.GradScaler(enabled=amp)
+    train_ids, val_ids = load_split(cache, cfg["split"])
+    anat_kind = "sobel" if cfg["mask_mode"] in {"anatomical", "hard_anat"} else None
+    tr = BraTSSliceDataset(cache, "pretrain", train_ids, anat_kind=anat_kind, augment=True)
+    va = BraTSSliceDataset(cache, "pretrain", val_ids, anat_kind=anat_kind, augment=False)
+    loader = DataLoader(tr, batch_size=cfg["batch_size"], shuffle=True, num_workers=cfg["workers"],
+                        pin_memory=True, drop_last=True, persistent_workers=cfg["workers"] > 0)
+    log(f"  pretrain {cfg['mask_mode']}/{cfg['fusion']}/{cfg['direction']}/p={cfg['mask_ratio']} "
+        f"ViT-{cfg['backbone']}: {len(train_ids)} cases, {len(tr):,} slices, "
+        f"{len(loader)} steps/epoch, device {device}")
 
-    history, step, t0 = [], 0, time.time()
-    for epoch in range(1, args.epochs + 1):
-        run_r = run_s = seen = 0.0
-        for i, batch in enumerate(train_loader):
-            if args.steps_per_epoch and i >= args.steps_per_epoch:
-                break
-            lr = cosine_lr(step, total_steps, args.lr, warmup)
-            for gi, g in enumerate(opt.param_groups):
-                g["lr"] = lr * (args.sampler_lr / args.lr if gi == 1 else 1.0)
+    model = build(cfg).to(device)
+    samp = [p for n, p in model.named_parameters() if n.startswith("sampler.")]
+    rest = [p for n, p in model.named_parameters() if not n.startswith("sampler.")]
+    groups = [{"params": rest, "base_lr": cfg["lr"]}]
+    if samp:
+        groups.append({"params": samp, "base_lr": cfg["sampler_lr"]})
+    opt = torch.optim.AdamW(groups, lr=cfg["lr"], betas=(0.9, 0.95),
+                            weight_decay=cfg["weight_decay"])
+    use_amp = cfg["amp"] and device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    total = cfg["epochs"] * len(loader)
+    warmup = max(1, int(0.1 * total))
 
-            img = batch["img"].to(device, non_blocking=True)
-            anat = batch["anat"].to(device, non_blocking=True)
+    last, start, history = out_dir / "pretrain_last.pt", 0, []
+    if last.exists():
+        ck = torch.load(last, map_location="cpu")
+        model.load_state_dict(ck["model"]); opt.load_state_dict(ck["opt"])
+        scaler.load_state_dict(ck["scaler"])
+        start, history = ck["epoch"], ck["history"]
+        log(f"  resuming pre-training from epoch {start}")
 
-            with torch.cuda.amp.autocast(enabled=amp):
-                out = model(img, anat, args.mask_ratio)
-                # Sec. 3.5.3 joint objective. loss_sampler already uses a detached
-                # reward, so the two terms train their own parameters.
-                loss = out["loss_recon"] + args.lambda_sampler * out["loss_sampler"]
-
+    model.train()
+    for epoch in range(start, cfg["epochs"]):
+        t0, sr, ss, n = time.time(), 0.0, 0.0, 0
+        for i, b in enumerate(loader):
+            step = epoch * len(loader) + i
+            for g in opt.param_groups:
+                g["lr"] = cosine_lr(step, total, g["base_lr"], warmup)
+            img = b["img"].to(device, non_blocking=True)
+            anat = b["anat"].to(device, non_blocking=True)
+            tis = b["tissue"].to(device, non_blocking=True)
+            with torch.autocast(device.type, enabled=use_amp):
+                out = model(img, anat, cfg["mask_ratio"], tis)
+                loss = out["loss_recon"] + cfg["lambda_sampler"] * out["loss_sampler"]
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
-            scaler.step(opt)
-            scaler.update()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["clip"])
+            scaler.step(opt); scaler.update()
+            sr += out["loss_recon"].item(); ss += out["loss_sampler"].item(); n += 1
+        sec = time.time() - t0
+        history.append({"epoch": epoch + 1, "train_mse": sr / max(n, 1),
+                        "sampler_loss": ss / max(n, 1), "seconds": sec})
+        log(f"    pt epoch {epoch+1}/{cfg['epochs']}  mse {sr/max(n,1):.5f}  "
+            f"L_S {ss/max(n,1):+.5f}  ({sec:.0f}s, {n*cfg['batch_size']/sec:.0f} img/s)")
+        torch.save({"model": model.state_dict(), "opt": opt.state_dict(),
+                    "scaler": scaler.state_dict(), "epoch": epoch + 1, "history": history}, last)
+        if should_stop and epoch + 1 < cfg["epochs"] and should_stop(sec):
+            raise TimeUp(f"pre-training saved at epoch {epoch+1}/{cfg['epochs']}")
 
-            run_r += out["loss_recon"].item()
-            run_s += float(out["loss_sampler"])
-            seen += 1
-            step += 1
-
-        val = evaluate(model, val_loader, args.mask_ratio, device, args.eval_batches)
-        history.append(dict(epoch=epoch, train_mse=run_r / max(seen, 1),
-                            sampler_loss=run_s / max(seen, 1), val_mse=val))
-        print(f"  epoch {epoch:3d}/{args.epochs}  train_mse {run_r/max(seen,1):.5f}  "
-              f"val_mse {val:.5f}  L_S {run_s/max(seen,1):+.4f}  "
-              f"[{time.time()-t0:.0f}s]")
-
-    final_val = history[-1]["val_mse"]
-    best_val = min(h["val_mse"] for h in history)
-
-    out_dir = Path(args.out_dir)
-    (out_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
-    (out_dir / "logs").mkdir(parents=True, exist_ok=True)
-
-    if not args.no_save:
-        torch.save({"model": model.state_dict(), "args": vars(args), "history": history},
-                   out_dir / "checkpoints" / f"{tag}.pt")
-    with open(out_dir / "logs" / f"{tag}.json", "w") as f:
-        json.dump({"args": vars(args), "history": history}, f, indent=2)
-
-    row = dict(
-        model=args.mask_mode, anat_kind=args.anat_kind, fusion=args.fusion,
-        mask_ratio=args.mask_ratio, fold=args.fold, epochs=args.epochs,
-        final_val_mse=round(final_val, 6), best_val_mse=round(best_val, 6),
-        params_M=round(n_par / 1e6, 2), minutes=round((time.time() - t0) / 60, 2),
-    )
-    csv_path = out_dir / "reconstruction.csv"
-    write_header = not csv_path.exists()
-    with open(csv_path, "a", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(row))
-        if write_header:
-            w.writeheader()
-        w.writerow(row)
-
-    print(f"  -> final val MSE {final_val:.5f} (best {best_val:.5f}) appended to {csv_path}")
-    return row
+    mse = fixed_mask_mse(model, va, device, cfg["eval_ratio"], workers=cfg["workers"],
+                         amp=cfg["amp"])
+    log(f"  fixed-mask reconstruction MSE (p={cfg['eval_ratio']}, brain patches): {mse:.6f}")
+    torch.save({"model": model.state_dict(), "config": cfg, "history": history}, final_path)
+    result = {"checkpoint": str(final_path), "fixed_mask_mse": mse, "config": cfg,
+              "history": history,
+              "minutes": sum(h["seconds"] for h in history) / 60}
+    json.dump(result, open(result_path, "w"), indent=1)
+    last.unlink(missing_ok=True)
+    return result
 
 
-# --------------------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser()
-    # data
     ap.add_argument("--cache", default="./cache")
-    ap.add_argument("--fold", type=int, default=1)
-    ap.add_argument("--synthetic", action="store_true")
-    ap.add_argument("--max_slices_per_patient", type=int, default=0)
-    # model
-    ap.add_argument("--mask_mode", default="anatomical",
-                    choices=["random", "adaptive", "anatomical", "hard_anat"])
-    ap.add_argument("--anat_kind", default="hybrid", choices=["sobel", "canny", "hybrid"])
-    ap.add_argument("--fusion", default="learnable", choices=["direct", "learnable"])
-    ap.add_argument("--mask_ratio", type=float, default=0.75)
-    ap.add_argument("--img_size", type=int, default=224)
-    ap.add_argument("--patch", type=int, default=16)
-    ap.add_argument("--dim", type=int, default=768)
-    ap.add_argument("--depth", type=int, default=12)
-    ap.add_argument("--heads", type=int, default=12)
-    ap.add_argument("--dec_dim", type=int, default=384)
-    ap.add_argument("--dec_depth", type=int, default=4)
-    ap.add_argument("--norm_pix_loss", action="store_true")
-    # optimization (Sec. 3.6.1)
-    ap.add_argument("--epochs", type=int, default=20)
-    ap.add_argument("--batch_size", type=int, default=32)
-    ap.add_argument("--lr", type=float, default=1.5e-4)
-    ap.add_argument("--sampler_lr", type=float, default=1e-4)
-    ap.add_argument("--weight_decay", type=float, default=0.05)
-    ap.add_argument("--lambda_sampler", type=float, default=1.0)
-    ap.add_argument("--clip", type=float, default=1.0)
-    ap.add_argument("--steps_per_epoch", type=int, default=0)
-    ap.add_argument("--eval_batches", type=int, default=0)
-    # runtime
-    ap.add_argument("--device", default="auto")
-    ap.add_argument("--workers", type=int, default=4)
-    ap.add_argument("--no_amp", action="store_true")
-    ap.add_argument("--no_save", action="store_true")
-    ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--out_dir", default="./results")
-    # sweep
-    ap.add_argument("--sweep", action="store_true", help="RQ1: all strategies x all ratios")
-    ap.add_argument("--sweep_modes", default="random,adaptive,hard_anat,anatomical")
-    ap.add_argument("--sweep_ratios", default="0.50,0.75,0.80")
-    args = ap.parse_args()
-
-    os.makedirs(args.out_dir, exist_ok=True)
-
-    if not args.sweep:
-        train_one(args)
-        return
-
-    modes = args.sweep_modes.split(",")
-    ratios = [float(r) for r in args.sweep_ratios.split(",")]
-    print(f"RQ1 sweep: {len(modes)} strategies x {len(ratios)} ratios = "
-          f"{len(modes)*len(ratios)} runs")
-    rows = []
-    for mode in modes:
-        for r in ratios:
-            args.mask_mode, args.mask_ratio = mode, r
-            rows.append(train_one(args))
-
-    print("\n=== RQ1 summary (final val MSE, lower is better) ===")
-    print(f"{'model':<12}" + "".join(f"{int(r*100)}%".rjust(10) for r in ratios))
-    for mode in modes:
-        cells = [next((f"{x['final_val_mse']:.5f}" for x in rows
-                       if x["model"] == mode and x["mask_ratio"] == r), "-") for r in ratios]
-        print(f"{mode:<12}" + "".join(c.rjust(10) for c in cells))
+    ap.add_argument("--out", default=None, help="output folder (default: results/manual/<tag>)")
+    for k, v in DEFAULTS.items():
+        if isinstance(v, bool):
+            ap.add_argument(f"--no_{k}", dest=k, action="store_false")
+        else:
+            ap.add_argument(f"--{k}", type=type(v), default=v)
+    a = vars(ap.parse_args())
+    cache, out = a.pop("cache"), a.pop("out")
+    tag = f"{a['mask_mode']}_{a['fusion']}_{a['direction']}_p{a['mask_ratio']}"
+    r = pretrain(cache, out or f"./results/manual/{tag}", **a)
+    print(json.dumps({k: r[k] for k in ("checkpoint", "fixed_mask_mse", "minutes")}, indent=1))
 
 
 if __name__ == "__main__":

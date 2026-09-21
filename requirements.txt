@@ -1,0 +1,8 @@
+# torch >= 2.7 is required for the RTX 5060 Ti (Blackwell); it also supports the RTX 3060.
+torch>=2.7
+numpy
+opencv-python-headless
+nibabel
+pandas
+scipy
+matplotlib

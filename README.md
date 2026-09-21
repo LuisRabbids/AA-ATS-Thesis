@@ -1,442 +1,71 @@
 # AA-ATS: Anatomically-Aware Adaptive Token Sampler
 
-This repository contains the implementation of our thesis project:
+Self-supervised masked-autoencoder pre-training for brain tumour segmentation on
+BraTS 2021, with a token sampler guided by self-derived Sobel anatomical features.
 
-**Anatomically-Aware Adaptive Token Sampler (AA-ATS)**
+## Pipeline
 
-AA-ATS extends Masked Autoencoders (MAE) by incorporating anatomical information from brain MRI into the masking process used during self-supervised pretraining.
+| Step | Script | Output |
+|---|---|---|
+| 1. Preprocess BraTS once | `prepare_data.py` | `cache/` (per-case slices, `manifest.csv`, `splits.json`) |
+| 2. Stage 1 / RQ1 grid | `run_stage1.py` | `results/stage1/stage1.csv` (Table 3.1) |
 
----
+`run_stage1.py` runs 12 configurations (fusion x direction x masking ratio). For each it
+pre-trains (`run_pretrain.py`), fine-tunes for segmentation (`finetune.py`) and appends one
+row to the CSV. Everything is resumable: rerun the same command after any interruption.
 
-# Repository Structure
-
-```text
-.
-├── data.py
-├── anatomy.py
-├── models.py
-├── run_pretrain.py
-├── check_progress.py
-├── plot_results.py
-├── diagnose_mse.py
-│
-├── cache/
-│   └── preprocessed BraTS data
-│
-├── results/
-│   ├── reconstruction.csv
-│   ├── checkpoints/
-│   ├── logs/
-│   └── figures/
-```
-
----
-
-# What Each File Does
-
-## data.py
-
-Handles loading and preprocessing of BraTS data.
-
-### Responsibilities
-
-- Load BraTS patients
-- Create train/validation folds
-- Extract axial slices
-- Apply augmentation
-- Generate tensors for training
-
-### Used By
-
-```text
-run_pretrain.py
-diagnose_mse.py
-```
-
----
-
-## anatomy.py
-
-Computes anatomical features used by AA-ATS.
-
-### Available Methods
-
-```text
-Sobel
-Canny
-Hybrid
-```
-
-### Outputs
-
-Generates four features per patch:
-
-```text
-mean
-max
-std
-density
-```
-
-These become:
-
-```text
-Aᵢ ∈ ℝ⁴
-```
-
-for each image patch.
-
----
-
-## models.py
-
-Contains the main model definitions.
-
-### Patch Embedding
-
-Converts MRI slices into transformer tokens.
-
-```text
-224×224 image
-↓
-196 patches
-↓
-Transformer tokens
-```
-
-### Token Sampler
-
-Implements multiple masking strategies:
-
-```text
-random
-adaptive
-hard_anat
-anatomical
-```
-
-### AA-ATS
-
-The proposed method that combines:
-
-```text
-Patch Embeddings
-+
-Anatomical Features
-```
-
-through a learnable fusion module.
-
-### Transformer Encoder
-
-Uses a ViT-Base backbone.
-
-### Decoder
-
-Used for self-supervised reconstruction.
-
----
-
-# Running AA-ATS
-
-This runs the proposed thesis model.
+## Setup (lab workstation)
 
 ```bash
-python run_pretrain.py \
-  --cache ./cache \
-  --mask_mode anatomical \
-  --mask_ratio 0.75 \
-  --epochs 20
+git clone https://github.com/LuisRabbids/AA-ATS-Thesis.git
+cd AA-ATS-Thesis
+python -m venv env
+source env/bin/activate
+pip install -r requirements.txt
+nvidia-smi                        # note the GPU index you are allowed to use
 ```
 
-### Example Configuration
-
-```text
-Model: AA-ATS
-Mask Ratio: 75%
-Epochs: 20
-Fusion: Learnable
-Anatomical Map: Hybrid
-```
-
----
-
-# Running Other Masking Strategies
-
-## Random MAE
+Put the preprocessed cache in `./cache` (from the Kaggle preprocessing notebook output),
+or build it from the raw tar:
 
 ```bash
-python run_pretrain.py \
-  --cache ./cache \
-  --mask_mode random \
-  --mask_ratio 0.75 \
-  --epochs 20
+python prepare_data.py --brats_tar /path/BraTS2021_Training_Data.tar --out ./cache
 ```
 
-## Adaptive Sampler
+## Running Stage 1
+
+Always inside tmux (`tmux`, then `Ctrl+b d` to detach, `tmux attach -t 0` to return).
 
 ```bash
-python run_pretrain.py \
-  --cache ./cache \
-  --mask_mode adaptive \
-  --mask_ratio 0.75 \
-  --epochs 20
+source env/bin/activate
+python run_stage1.py --cache ./cache --device cuda:0 --smoke   # ~10 min: test + time estimate
+python run_stage1.py --cache ./cache --device cuda:0           # full grid
+python run_stage1.py --cache ./cache --list                    # progress and ranking
 ```
 
-## Rule-Based Anatomical Masking
-
-```bash
-python run_pretrain.py \
-  --cache ./cache \
-  --mask_mode hard_anat \
-  --mask_ratio 0.75 \
-  --epochs 20
-```
-
----
-
-# Running All Configurations
-
-Run the complete experimental sweep:
-
-```bash
-python run_pretrain.py \
-  --cache ./cache \
-  --sweep \
-  --epochs 20
-```
-
-This automatically runs:
-
-```text
-4 masking strategies
-×
-3 masking ratios
-=
-12 experiments
-```
-
----
-
-# Outputs
-
-## reconstruction.csv
-
-Located at:
-
-```text
-results/reconstruction.csv
-```
-
-Stores:
-
-```text
-model
-mask_ratio
-epochs
-final_val_mse
-best_val_mse
-minutes
-```
-
-Each completed experiment appends one row.
-
----
-
-## checkpoints
-
-Located at:
-
-```text
-results/checkpoints/
-```
-
-Stores trained model weights:
-
-```text
-*.pt
-```
-
----
-
-## logs
-
-Located at:
-
-```text
-results/logs/
-```
-
-Stores epoch-by-epoch training history:
-
-```text
-*.json
-```
-
----
-
-# Checking Progress
-
-If a sweep is still running:
-
-```bash
-python check_progress.py \
-  --results ./results
-```
-
-Displays:
-
-- Completed runs
-- Missing runs
-- Duplicate runs
-- Currently available comparisons
-
----
-
-# Generating Tables and Figures
-
-```bash
-python plot_results.py \
-  --results ./results
-```
-
-Produces:
-
-```text
-table_3_1_reconstruction.csv
-figures/
-```
-
----
-
-# Useful Commands
-
-## Train AA-ATS
-
-```bash
-python run_pretrain.py \
-  --cache ./cache \
-  --mask_mode anatomical \
-  --mask_ratio 0.75 \
-  --epochs 20
-```
-
-## Train Random MAE
-
-```bash
-python run_pretrain.py \
-  --cache ./cache \
-  --mask_mode random \
-  --mask_ratio 0.75 \
-  --epochs 20
-```
-
-## Continue Sweep
-
-```bash
-python run_pretrain.py \
-  --cache ./cache \
-  --sweep
-```
-
-## Generate Figures
-
-```bash
-python plot_results.py \
-  --results ./results
-```
-
----
-
-# Modifying AA-ATS
-
-If you want to modify the proposed model:
-
-## Change Anatomical Features
-
-Edit:
-
-```text
-anatomy.py
-```
-
-## Change Fusion Logic
-
-Edit:
-
-```text
-models.py
-```
-
-Look for:
-
-```python
-# Direct Fusion
-# Learnable Fusion
-```
-
-## Change Sampling Strategy
-
-Edit:
-
-```python
-sample_visible()
-```
-
-inside:
-
-```text
-models.py
-```
-
-## Change Training Parameters
-
-Edit:
-
-```text
-run_pretrain.py
-```
-
-or pass command-line arguments:
-
-```bash
---epochs
---mask_ratio
---batch_size
---lr
-```
-
----
-
-# Typical Workflow
-
-```text
-Prepare BraTS Data
-↓
-Run Training
-↓
-Generate Results
-↓
-Inspect Figures
-↓
-Modify Model
-↓
-Train Again
-```
-
----
-
-# Quick Start
-
-```bash
-python run_pretrain.py \
-  --cache ./cache \
-  --mask_mode anatomical \
-  --mask_ratio 0.75 \
-  --epochs 20
-
-python plot_results.py \
-  --results ./results
-```
-
-This is the fastest way to train and evaluate AA-ATS.
+**Lab slot (ends 4:30 PM):** add `--stop_at 16:15`. The run finishes its current epoch,
+saves, and exits before 16:15. Next session, rerun the same command to continue.
+
+**Two GPUs** (e.g. Kaggle T4 x2): run `--shard 0/2 --device cuda:0` and
+`--shard 1/2 --device cuda:1` side by side. Both write to the same CSV safely. The lab
+workstation has one GPU, so there the default (`--shard 0/1`) runs all 12 in sequence.
+
+Defaults: ViT-Small, 50 pre-training epochs, 30 fine-tuning epochs, fine-tuning on every
+2nd slice. Change with `--backbone`, `--pt_epochs`, `--ft_epochs`, `--ft_stride`.
+
+## Files
+
+| File | Role (manuscript section) |
+|---|---|
+| `prepare_data.py` | crop 240->224, per-volume normalization, tissue index, dev/experimental splits (3.2-3.3) |
+| `anatomy.py` | Sobel map from FLAIR, patch descriptors A_i (3.4.2) |
+| `data.py` | datasets, brain-masked augmentation (3.6.3) |
+| `models.py` | MAE, AA-ATS sampler, sampling direction, tissue-restricted losses (3.4-3.5) |
+| `run_pretrain.py` | pre-training + fixed-mask reconstruction MSE (3.6, 3.8.3) |
+| `finetune.py` | segmentation fine-tuning, per-patient WT/TC/ET metrics (3.7, 3.8.4) |
+| `run_stage1.py` | Stage 1 configuration grid (3.8.2) |
+| `metadata/` | case partition, tumour volumes, bounding boxes |
+
+Legacy from the first prototype (not updated to the new checkpoint format):
+`diagnose_mse.py`, `visualize_masking.py`, `plot_results.py`, `plot_results(comp).py`,
+`check_progress.py`.

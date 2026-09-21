@@ -61,9 +61,15 @@ def load_fold(cache_root, fold=1):
 # --------------------------------------------------------------------------------------
 # Packing .npz -> memory-mapped .npy
 # --------------------------------------------------------------------------------------
+def _packed_root(cache_root):
+    """Where packed arrays go: $AATS_PACKED_DIR if set, else <cache>/packed.
+    Set AATS_PACKED_DIR when the cache is read-only (e.g. a Kaggle input)."""
+    return Path(os.environ.get("AATS_PACKED_DIR") or Path(cache_root, "packed"))
+
+
 def _pack(cache_root, stage, case_ids, stride):
     key = hashlib.md5(("|".join(sorted(case_ids)) + f"|{stage}|{stride}").encode()).hexdigest()[:10]
-    out = Path(cache_root, "packed", f"{stage}_s{stride}_{key}")
+    out = _packed_root(cache_root) / f"{stage}_s{stride}_{key}"
     if (out / "done").exists():
         return out
 

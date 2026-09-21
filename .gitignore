@@ -2,23 +2,25 @@
 __pycache__/
 *.pyc
 
-# Environments
-.venv/
+# Environments (the lab docs use env/)
+env/
 venv/
+.venv/
 
 # Mac
 .DS_Store
 
-# Cached BraTS data
+# Data: never commit imaging data or the preprocessed cache
+raw/
 cache/
+packed/
+*.nii
+*.nii.gz
+*.tar
 
-# Results
-results/
-
-# Large files
+# Model weights (large). Results CSVs, JSON and logs ARE committed.
 *.pt
 *.pth
 
 # Jupyter
 .ipynb_checkpoints/
-

@@ -32,6 +32,7 @@ import argparse
 import json
 import math
 import time
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -178,7 +179,9 @@ def evaluate(model, ds, device, batch_size=32, workers=2, with_hd95=False, amp=T
     model.train()
 
     keys = [k for k in per_case[0] if k != "case_id"]
-    summary = {k: float(np.nanmean([r[k] for r in per_case])) for k in keys}
+    with warnings.catch_warnings():      # recall is NaN for cases without that region
+        warnings.simplefilter("ignore", RuntimeWarning)
+        summary = {k: float(np.nanmean([r[k] for r in per_case])) for k in keys}
     summary["dsc_mean"] = float(np.mean([summary[f"dsc_{r}"] for r in REGIONS]))
     return summary, per_case
 
@@ -194,7 +197,7 @@ def cosine_lr(step, total, base, warmup):
 
 def finetune(pretrained, cache, split, out_dir, backbone="small", epochs=30, batch_size=16,
              lr=3e-4, weight_decay=0.05, train_stride=2, workers=4, device="cuda",
-             seed=42, with_hd95=False, amp=True, log=print):
+             seed=42, with_hd95=False, amp=True, log=print, should_stop=None):
     """Fine-tune one pre-trained encoder and evaluate it. Returns the summary metrics."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -262,6 +265,9 @@ def finetune(pretrained, cache, split, out_dir, backbone="small", epochs=30, bat
         torch.save({"model": model.state_dict(), "opt": opt.state_dict(),
                     "scaler": scaler.state_dict(), "epoch": epoch + 1, "history": history},
                    ckpt_path)
+        if should_stop and epoch + 1 < epochs and should_stop(history[-1]["seconds"]):
+            from run_pretrain import TimeUp
+            raise TimeUp(f"fine-tuning saved at epoch {epoch+1}/{epochs}")
 
     summary, per_case = evaluate(model, va, device, batch_size=2 * batch_size,
                                  workers=workers, with_hd95=with_hd95, amp=amp)
