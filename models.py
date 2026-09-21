@@ -285,7 +285,9 @@ class MaskedAutoencoder(nn.Module):
         """Eq. 3.19-3.20 and Eq. 3.5: scatter visible latents back, fill with mask tokens."""
         B = fv.shape[0]
         fv = self.dec_embed(fv)
-        full = self.mask_token.expand(B, N, -1).clone()
+        # Under mixed precision fv is fp16 while the learnable mask token is fp32;
+        # match dtypes before scattering (gradients still flow to mask_token).
+        full = self.mask_token.expand(B, N, -1).to(fv.dtype).clone()
         full = full.scatter(1, ids_keep[..., None].expand(-1, -1, fv.shape[-1]), fv)
         full = full + self.dec_pos                               # Eq. 3.20
         for blk in self.dec_blocks:
