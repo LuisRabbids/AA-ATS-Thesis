@@ -17,6 +17,7 @@ Usage
   python run_stage1.py --cache ./cache --list           # what's done / pending
   two GPUs:  --device cuda:0 --shard 0/2   and   --device cuda:1 --shard 1/2
   lab slot:  --stop_at 16:15   finish the current epoch, save, and exit before 16:15
+  Kaggle:    --max_hours 11   exit cleanly before the 12-hour background-run limit
 """
 
 import argparse
@@ -25,7 +26,7 @@ import itertools
 import json
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from finetune import finetune
@@ -72,13 +73,26 @@ def make_logger(path):
     return log
 
 
-def make_should_stop(stop_at, log):
-    """Stop if starting another epoch of the same length would pass stop_at (HH:MM, today)."""
-    if not stop_at:
+def make_should_stop(stop_at, max_hours, log):
+    """
+    Stop if starting another epoch of the same length would pass the deadline.
+    stop_at   'HH:MM' clock time; if that time has already passed today, it means tomorrow
+    max_hours hours from now
+    If both are given, the earlier deadline wins.
+    """
+    deadlines = []
+    if stop_at:
+        h, m = map(int, stop_at.split(":"))
+        d = datetime.now().replace(hour=h, minute=m, second=0, microsecond=0)
+        if d <= datetime.now():
+            d += timedelta(days=1)
+        deadlines.append(d)
+    if max_hours:
+        deadlines.append(datetime.now() + timedelta(hours=max_hours))
+    if not deadlines:
         return None
-    h, m = map(int, stop_at.split(":"))
-    deadline = datetime.now().replace(hour=h, minute=m, second=0, microsecond=0)
-    log(f"Will stop cleanly before {deadline:%H:%M}.")
+    deadline = min(deadlines)
+    log(f"Will stop cleanly before {deadline:%Y-%m-%d %H:%M}.")
 
     def should_stop(epoch_seconds):
         return time.time() + 1.1 * epoch_seconds > deadline.timestamp()
@@ -132,6 +146,8 @@ def main():
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--shard", default="0/1", help="i/n: run every n-th config starting at i")
     ap.add_argument("--stop_at", default=None, help="HH:MM: exit cleanly before this time")
+    ap.add_argument("--max_hours", type=float, default=None,
+                    help="exit cleanly before this many hours from now")
     ap.add_argument("--list", action="store_true", help="show status and exit")
     ap.add_argument("--smoke", action="store_true",
                     help="1 pre-train + 1 fine-tune epoch on one config, then estimate the grid")
@@ -165,7 +181,7 @@ def main():
         f"{len(mine)-len(todo)} already done, {len(todo)} to run | ViT-{a.backbone}, "
         f"{a.pt_epochs} pt + {a.ft_epochs} ft epochs, device {a.device}")
 
-    a.should_stop = make_should_stop(a.stop_at, log)
+    a.should_stop = make_should_stop(a.stop_at, a.max_hours, log)
     for k, c in enumerate(todo, 1):
         log(f"=== [{k}/{len(todo)}] {c['tag']} ===")
         if a.should_stop and a.should_stop(0):

@@ -46,6 +46,8 @@ python run_stage1.py --cache ./cache --list                    # progress and ra
 **Lab slot (ends 4:30 PM):** add `--stop_at 16:15`. The run finishes its current epoch,
 saves, and exits before 16:15. Next session, rerun the same command to continue.
 
+**Kaggle background run (12-hour limit):** add `--max_hours 11` to exit cleanly in time.
+
 **Two GPUs** (e.g. Kaggle T4 x2): run `--shard 0/2 --device cuda:0` and
 `--shard 1/2 --device cuda:1` side by side. Both write to the same CSV safely. The lab
 workstation has one GPU, so there the default (`--shard 0/1`) runs all 12 in sequence.
