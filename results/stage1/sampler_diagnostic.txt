@@ -1,0 +1,16 @@
+configuration                L_S first  L_S last  MSE first  MSE last    mass   unif  verdict
+direct_masked_p0.50           -0.15494  -0.06867    0.38057   0.02551   2.692  0.145  concentrates on scored (18.50x)
+direct_masked_p0.75           -0.18726  -0.08043    0.38472   0.02940   2.735  0.218  concentrates on scored (12.53x)
+direct_masked_p0.90           -0.20248  -0.09829    0.39109   0.03929   2.502  0.262  concentrates on scored (9.55x)
+direct_visible_p0.50          -0.04660  -0.00006    0.35871   0.01134   0.005  0.145  avoids scored (0.04x)
+direct_visible_p0.75          -0.09976  -0.00271    0.37539   0.01092   0.248  0.218  near uniform (1.14x)
+direct_visible_p0.90          -0.15418  -0.00979    0.38817   0.01463   0.670  0.262  concentrates on scored (2.56x)
+modulated_masked_p0.50        -0.15494  -0.06993    0.38057   0.02739   2.553  0.145  concentrates on scored (17.54x)
+modulated_masked_p0.75        -0.18727  -0.07501    0.38471   0.02950   2.543  0.218  concentrates on scored (11.65x)
+modulated_masked_p0.90        -0.20248  -0.10993    0.39109   0.04053   2.712  0.262  concentrates on scored (10.36x)
+modulated_visible_p0.50       -0.04660  -0.00006    0.35871   0.01176   0.005  0.145  avoids scored (0.04x)
+modulated_visible_p0.75       -0.09975  -0.00270    0.37539   0.01091   0.247  0.218  near uniform (1.13x)
+modulated_visible_p0.90       -0.15418  -0.00983    0.38817   0.01465   0.671  0.262  concentrates on scored (2.56x)
+
+12 configurations with a learned sampler | 2 near uniform, 8 concentrating, 2 avoiding
+Departure from the uniform reference indicates the objective of Eq. 3.21 produced a usable learning signal; the sign of the departure follows the sampling direction, since 'visible' draws high-probability tokens out of the scored set and 'masked' draws them into it.
