@@ -45,8 +45,16 @@ N_PATCH = GRID * GRID
 # Splits
 # --------------------------------------------------------------------------------------
 def load_split(cache_root, name="dev"):
-    """name: 'dev' (Stage 1) or 'fold_1'..'fold_5' (Stage 2). Returns (train_ids, val_ids)."""
-    with open(Path(cache_root, "splits.json")) as f:
+    """
+    name: 'dev' (Stage 1) or 'fold_1'...  Returns (train_ids, val_ids).
+
+    Reads <cache>/splits.json, or the file named by $AATS_SPLITS_JSON when set. The
+    override exists because the cache may be read-only (a Kaggle dataset input) while
+    the fold count differs from the one baked in at preprocessing time; run_stage2.py
+    regenerates the folds from metadata/ and points this at the result.
+    """
+    path = os.environ.get("AATS_SPLITS_JSON") or Path(cache_root, "splits.json")
+    with open(path) as f:
         splits = json.load(f)
     if name not in splits:
         raise KeyError(f"'{name}' not in splits.json (available: {list(splits)})")
