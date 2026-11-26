@@ -155,12 +155,20 @@ class MaskedAutoencoder(nn.Module):
         fusion="modulated",
         norm_pix_loss=False,
         direction="visible",
+        guidance=1.0,
+        sampler_obj="prob",
+        ent_coef=0.0,
     ):
         super().__init__()
         assert mask_mode in {"random", "adaptive", "anatomical", "hard_anat"}
         assert direction in {"visible", "masked"}
+        assert sampler_obj in {"prob", "logprob"}
+        assert 0.0 <= guidance <= 1.0
         self.mask_mode = mask_mode
         self.direction = direction
+        self.guidance = guidance          # alpha: fraction of the drawn set taken from P
+        self.sampler_obj = sampler_obj    # 'prob' = Eq. 3.21; 'logprob' = REINFORCE form
+        self.ent_coef = ent_coef          # entropy bonus on P, discourages collapse
         self.patch = patch
         self.in_ch = in_ch
         self.norm_pix_loss = norm_pix_loss
@@ -229,6 +237,32 @@ class MaskedAutoencoder(nn.Module):
     # ---------------------------------------------------------------------------------
     # Masking (Sec. 3.4.3 part 3, Eq. 3.15-3.16)
     # ---------------------------------------------------------------------------------
+    def _draw(self, probs, n):
+        """
+        Draw n distinct token indices per sample, blending the learned distribution with
+        a uniform draw. A fraction alpha = self.guidance of the n tokens is drawn from P
+        (multinomial, without replacement); the remaining (1 - alpha) n are drawn
+        uniformly from the tokens not already taken.
+
+        guidance = 1.0 reproduces pure multinomial sampling from P (Eq. 3.13).
+        guidance = 0.0 reproduces the uniform draw of mask_mode 'random'.
+        """
+        B, N = probs.shape
+        k = max(0, min(n, int(round(self.guidance * n))))
+
+        if k == n:
+            return torch.multinomial(probs, n, replacement=False)
+        if k == 0:
+            return torch.rand(B, N, device=probs.device).argsort(dim=1)[:, :n]
+
+        guided = torch.multinomial(probs, k, replacement=False)
+        taken = torch.zeros(B, N, dtype=torch.bool, device=probs.device)
+        taken.scatter_(1, guided, True)
+        # tokens already drawn are pushed past every random key so they cannot repeat
+        keys = torch.rand(B, N, device=probs.device).masked_fill(taken, 2.0)
+        rest = keys.argsort(dim=1)[:, : n - k]
+        return torch.cat([guided, rest], dim=1)
+
     def sample_visible(self, x, anat, mask_ratio):
         """
         Returns (ids_keep [B, Nv], mask [B, N] with 1 = masked, probs [B, N] or None).
@@ -257,9 +291,9 @@ class MaskedAutoencoder(nn.Module):
             # x is detached so L_S cannot reach the encoder through the patch embedding
             probs = self.sampler(x.detach(), anat)                          # Eq. 3.12
             if self.direction == "visible":
-                ids_keep = torch.multinomial(probs, Nv, replacement=False)  # Eq. 3.13
+                ids_keep = self._draw(probs, Nv)                            # Eq. 3.13
             else:
-                ids_mask = torch.multinomial(probs, Nm, replacement=False)
+                ids_mask = self._draw(probs, Nm)
                 m = torch.zeros(B, N, dtype=torch.bool, device=x.device)
                 m.scatter_(1, ids_mask, True)
                 ids_keep = (~m).nonzero(as_tuple=True)[1].view(B, Nv)
@@ -320,13 +354,20 @@ class MaskedAutoencoder(nn.Module):
         scored = mask if tissue is None else mask * tissue.float()
         loss_recon = (per_tok * scored).sum() / scored.sum().clamp(min=1)
 
-        # Eq. 3.21: L_S = -sum_{i in I_m ∩ B} p_i * L_R(i). The reconstruction error is
-        # detached, so L_S updates only the sampler (Sec. 3.5.2). Identical in both
-        # sampling directions.
+        # Eq. 3.21: L_S = -sum_{i in I_m ∩ B} p_i * L_R(i) ('prob'), or the REINFORCE
+        # form -sum log p_i * L_R(i) ('logprob'). The reconstruction error is detached,
+        # so L_S updates only the sampler (Sec. 3.5.2). Identical in both directions.
         loss_sampler = torch.zeros((), device=img.device)
         if probs is not None:
             r = (per_tok * scored).detach()
-            loss_sampler = -(probs * r).sum(dim=1).mean()
+            if self.sampler_obj == "logprob":
+                loss_sampler = -(probs.clamp_min(1e-8).log() * r).sum(dim=1).mean()
+            else:
+                loss_sampler = -(probs * r).sum(dim=1).mean()
+            if self.ent_coef > 0.0:
+                # entropy bonus on P: penalises collapse onto a few tokens
+                ent = -(probs * probs.clamp_min(1e-8).log()).sum(dim=1).mean()
+                loss_sampler = loss_sampler - self.ent_coef * ent
 
         return {
             "loss_recon": loss_recon,

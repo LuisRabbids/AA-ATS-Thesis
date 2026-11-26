@@ -35,6 +35,7 @@ from models import MaskedAutoencoder
 BACKBONES = {"small": dict(dim=384, depth=12, heads=6), "base": dict(dim=768, depth=12, heads=12)}
 DEFAULTS = dict(
     mask_mode="anatomical", fusion="modulated", direction="visible", mask_ratio=0.75,
+    guidance=1.0, sampler_obj="prob", ent_coef=0.0,
     backbone="small", epochs=50, batch_size=64, lr=1.5e-4, sampler_lr=1e-4,
     weight_decay=0.05, lambda_sampler=1.0, clip=1.0, split="dev", eval_ratio=0.75,
     workers=4, device="cuda", amp=True, seed=42,
@@ -49,7 +50,10 @@ def cosine_lr(step, total, base, warmup):
 
 def build(cfg):
     return MaskedAutoencoder(mask_mode=cfg["mask_mode"], fusion=cfg["fusion"],
-                             direction=cfg["direction"], **BACKBONES[cfg["backbone"]])
+                             direction=cfg["direction"], guidance=cfg.get("guidance", 1.0),
+                             sampler_obj=cfg.get("sampler_obj", "prob"),
+                             ent_coef=cfg.get("ent_coef", 0.0),
+                             **BACKBONES[cfg["backbone"]])
 
 
 @torch.no_grad()
@@ -100,6 +104,7 @@ def pretrain(cache, out_dir, log=print, should_stop=None, **overrides):
     loader = DataLoader(tr, batch_size=cfg["batch_size"], shuffle=True, num_workers=cfg["workers"],
                         pin_memory=True, drop_last=True, persistent_workers=cfg["workers"] > 0)
     log(f"  pretrain {cfg['mask_mode']}/{cfg['fusion']}/{cfg['direction']}/p={cfg['mask_ratio']} "
+        f"alpha={cfg['guidance']}/{cfg['sampler_obj']}/ent={cfg['ent_coef']} "
         f"ViT-{cfg['backbone']}: {len(train_ids)} cases, {len(tr):,} slices, "
         f"{len(loader)} steps/epoch, device {device}")
 
@@ -127,6 +132,7 @@ def pretrain(cache, out_dir, log=print, should_stop=None, **overrides):
     model.train()
     for epoch in range(start, cfg["epochs"]):
         t0, sr, ss, n = time.time(), 0.0, 0.0, 0
+        nsc, ntis = 0.0, 0.0        # masked-and-tissue tokens vs all tissue tokens
         for i, b in enumerate(loader):
             step = epoch * len(loader) + i
             for g in opt.param_groups:
@@ -143,11 +149,17 @@ def pretrain(cache, out_dir, log=print, should_stop=None, **overrides):
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["clip"])
             scaler.step(opt); scaler.update()
             sr += out["loss_recon"].item(); ss += out["loss_sampler"].item(); n += 1
+            nsc += out["n_scored"].item(); ntis += tis.sum().item()
         sec = time.time() - t0
+        # Share of brain patches that were masked. Uniform masking gives p; a sampler
+        # that targets tissue pushes it towards 1, and the guidance blend moves it back.
+        tm = nsc / max(ntis, 1.0)
         history.append({"epoch": epoch + 1, "train_mse": sr / max(n, 1),
-                        "sampler_loss": ss / max(n, 1), "seconds": sec})
+                        "sampler_loss": ss / max(n, 1), "tissue_masked": tm,
+                        "seconds": sec})
         log(f"    pt epoch {epoch+1}/{cfg['epochs']}  mse {sr/max(n,1):.5f}  "
-            f"L_S {ss/max(n,1):+.5f}  ({sec:.0f}s, {n*cfg['batch_size']/sec:.0f} img/s)")
+            f"L_S {ss/max(n,1):+.5f}  tissue masked {tm:.3f}  "
+            f"({sec:.0f}s, {n*cfg['batch_size']/sec:.0f} img/s)")
         torch.save({"model": model.state_dict(), "opt": opt.state_dict(),
                     "scaler": scaler.state_dict(), "epoch": epoch + 1, "history": history}, last)
         if should_stop and epoch + 1 < cfg["epochs"] and should_stop(sec):

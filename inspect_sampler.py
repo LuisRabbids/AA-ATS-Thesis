@@ -56,6 +56,13 @@ def main():
         m0, m1 = h[0]["train_mse"], h[-1]["train_mse"]
         if abs(ls1) < 1e-12 or m1 <= 0:
             continue                                   # baselines with no sampler
+        if cfg.get("sampler_obj", "prob") != "prob":
+            # |L_S| / L_R is an error-weighted probability mass only for Eq. 3.21. The
+            # REINFORCE form sums log p_i instead of p_i, so the quotient is not a mass
+            # and is not comparable to the uniform reference.
+            print(f"{tag:<28}{ls0:>10.5f}{ls1:>10.5f}{m0:>11.5f}{m1:>10.5f}"
+                  f"{'-':>8}{'-':>7}  log-p objective, mass not defined")
+            continue
         mass = abs(ls1) / m1                           # share of mass on scored tokens
         unif = cfg.get("mask_ratio", 0.75) * a.rho
         ratio = mass / unif
