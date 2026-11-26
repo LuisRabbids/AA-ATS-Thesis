@@ -26,7 +26,7 @@ import pandas as pd
 from analyze_stage1 import holm, load, paired
 
 REFERENCE = "modulated_masked_p0.75"
-ORDER = ["alpha000", "alpha010", "alpha025", "alpha050",
+ORDER = ["alpha000", "alpha010", "alpha025", "alpha050", "alpha100_s43",
          "logp_lam005", "logp_lam05", "logp_ent01"]
 
 

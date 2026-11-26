@@ -66,13 +66,23 @@ CONFIGS = {
     "logp_lam005":  dict(sampler_obj="logprob", lambda_sampler=0.005),
     "logp_lam05":   dict(sampler_obj="logprob", lambda_sampler=0.05),
     "logp_ent01":   dict(sampler_obj="logprob", lambda_sampler=0.005, ent_coef=0.01),
+
+    # --- replicate: the submitted configuration again under a second seed ----------
+    # Every conclusion in Stage 1 and Stage 2 rests on single-seed differences of
+    # 0.3-0.5 Dice points, and nothing so far estimates how much an identical
+    # configuration moves between training runs. This run is identical to the Stage 1
+    # cell 'modulated_masked_p0.75' except for the seed, so the gap between the two is
+    # a direct bound on run-to-run noise. It also checks that the reused Stage 1
+    # reference is still comparable under the current code.
+    "alpha100_s43": dict(seed=43),
 }
 # Interleaved so a 2-shard split puts roughly half of each family on each GPU.
+# Interleaved so a 2-shard split gives each GPU four jobs.
 ORDER = ["alpha050", "logp_lam005", "alpha025", "logp_lam05",
-         "alpha010", "logp_ent01", "alpha000"]
+         "alpha010", "logp_ent01", "alpha000", "alpha100_s43"]
 REFERENCE = ("alpha100", "results/stage1/stage1.csv", "modulated_masked_p0.75")
 
-COLUMNS = ["tag", "guidance", "sampler_obj", "lambda_sampler", "ent_coef",
+COLUMNS = ["tag", "guidance", "sampler_obj", "lambda_sampler", "ent_coef", "seed",
            "dsc_mean", "dsc_WT", "dsc_TC", "dsc_ET",
            "recall_WT", "recall_TC", "recall_ET", "fixed_mask_mse", "tissue_masked",
            "pt_epochs", "ft_epochs", "ft_stride", "backbone",
@@ -80,7 +90,8 @@ COLUMNS = ["tag", "guidance", "sampler_obj", "lambda_sampler", "ent_coef",
 
 
 def full_cfg(name):
-    c = dict(BASE, guidance=1.0, sampler_obj="prob", ent_coef=0.0, lambda_sampler=1.0)
+    c = dict(BASE, guidance=1.0, sampler_obj="prob", ent_coef=0.0, lambda_sampler=1.0,
+             seed=42)
     c.update(CONFIGS[name])
     return c
 
@@ -145,10 +156,11 @@ def run_job(name, a, out_root, log):
     ft = finetune(pt["checkpoint"], a.cache, "dev", run_dir, backbone=a.backbone,
                   epochs=a.ft_epochs, batch_size=a.ft_batch, train_stride=a.ft_stride,
                   device=a.device, workers=a.workers, log=log, with_hd95=False,
-                  should_stop=a.should_stop)
+                  seed=cfg["seed"], should_stop=a.should_stop)
     hist = json.load(open(run_dir / "finetune_result.json"))["history"]
     return {"tag": name, "guidance": cfg["guidance"], "sampler_obj": cfg["sampler_obj"],
             "lambda_sampler": cfg["lambda_sampler"], "ent_coef": cfg["ent_coef"],
+            "seed": cfg["seed"],
             **{k: round(v, 5) for k, v in ft.items()},
             "fixed_mask_mse": round(pt["fixed_mask_mse"], 6),
             "tissue_masked": round(pt["history"][-1].get("tissue_masked", float("nan")), 4),
@@ -166,7 +178,7 @@ def reference_row():
     for r in csv.DictReader(open(path)):
         if r["tag"] == tag:
             return {"tag": name, "guidance": 1.0, "sampler_obj": "prob",
-                    "lambda_sampler": 1.0, "ent_coef": 0.0,
+                    "lambda_sampler": 1.0, "ent_coef": 0.0, "seed": 42,
                     "dsc_mean": r["dsc_mean"], "fixed_mask_mse": r["fixed_mask_mse"],
                     "finished": "Stage 1"}
     return None
@@ -185,7 +197,7 @@ def summarize(csv_path):
     print(f"\n{'configuration':<16}{'alpha':>7}{'objective':>11}{'lambda':>8}"
           f"{'ent':>6}{'DSC mean':>10}{'MSE':>10}{'tissue masked':>15}")
     order = ["alpha000", "alpha010", "alpha025", "alpha050", "alpha100",
-             "logp_lam005", "logp_lam05", "logp_ent01"]
+             "alpha100_s43", "logp_lam005", "logp_lam05", "logp_ent01"]
     for t in order:
         r = by_tag.get(t)
         if not r:
