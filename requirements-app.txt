@@ -1,9 +1,18 @@
-# Dependencies for the Streamlit demo (app.py) only.
-# The CPU wheel is requested explicitly: the default Linux torch wheel ships CUDA and is
-# several gigabytes, which exceeds the build limits on Streamlit Community Cloud.
+# Dependencies for the Streamlit demo (app.py) only. The training pipeline uses
+# requirements.txt instead, which pins a much newer torch for the training GPUs.
+#
+# The CPU wheel index is requested explicitly because the default Linux torch wheel
+# ships CUDA and runs to several gigabytes. PyPI stays the primary index, so macOS and
+# Windows resolve normally.
 --extra-index-url https://download.pytorch.org/whl/cpu
 
 streamlit>=1.40
-torch>=2.2
-numpy>=1.24
 matplotlib>=3.7
+
+# torch stopped shipping macOS x86_64 wheels after 2.2.2, so an Intel Mac resolves to
+# that version. It predates NumPy 2 and was built against the 1.x C API, so NumPy is
+# capped there as well, or torch.from_numpy fails at runtime. Python 3.12 or older is
+# required on that platform: no 2.2.2 wheel was built for 3.13.
+torch>=2.2
+numpy>=1.24,<2 ; sys_platform == "darwin" and platform_machine == "x86_64"
+numpy>=1.24 ; sys_platform != "darwin" or platform_machine != "x86_64"
